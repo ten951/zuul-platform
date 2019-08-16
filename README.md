@@ -105,7 +105,7 @@ public class FilterProcessor {
 }
 ```
 
-FilterLoader.getInstance().getFiltersByType(sType); 是获取sType类型的filter.
+FilterLoader.getInstance().getFiltersByType(sType); 是获取sType类型的filter. 并按照优先级进行排序.
 其背后调用了FilterRegistry这个类 这个类很简单, 维护了一个ConcurrentHashMap<String, ZuulFilter> filters 容器. 
 这两个类的初始化都是在ZuulServerAutoConfiguration这个自动装载的
 ```java
@@ -127,4 +127,143 @@ FilterLoader.getInstance().getFiltersByType(sType); 是获取sType类型的filte
 	}
 ```
 
-这个filters属性时如何初始化的. 最终代码找到了FilterFileManager类和
+这个filters属性时如何初始化的. 业务自己定义的filter只要交给spring托管, 就可以加载进来. 但是zuul自己提供的10个filter. 就需要FilterFileManager它来负责加载了.
+
+#### pre过滤器
+
+##### ServletDetectionFilter 检测当前请求是通过Spring的DispatcherServlet处理运行，还是通过ZuulServlet来处理运行
+
+优先级 -3. 
+
+##### Servlet30WrapperFilter 将原始的HttpServletRequest包装成Servlet30RequestWrapper对象
+
+优先级 -2
+
+##### FormBodyWrapperFilter 将符合条件的请求包装成FormBodyRequestWrapper对象
+
+优先级 -1
+
+application/x-www-form-urlencoded 或者 multipart/form-data 时候执行
+
+##### DebugFilter 将当前RequestContext中的debugRouting和debugRequest参数设置为true
+
+优先级 1
+
+请求中的debug参数（该参数可以通过zuul.debug.parameter来自定义）为true，或者配置参数zuul.debug.request为true时执行
+
+##### PreDecorationFilter 
+
+优先级 5
+
+RequestContext不存在forward.to和serviceId两个参数时执行
+```java
+public class PreDecorationFilter extends ZuulFilter {
+@Override
+	public Object run() {
+//获取请求上下文
+		RequestContext ctx = RequestContext.getCurrentContext();
+//获取请求路径
+		final String requestURI = this.urlPathHelper
+				.getPathWithinApplication(ctx.getRequest());
+//获取路由信息(CompositeRouteLocator 实在自动装配阶段装配的)
+		Route route = this.routeLocator.getMatchingRoute(requestURI);
+// 路由存在
+		if (route != null) {
+//获取路由的定位信息(url或者serviceId)
+			String location = route.getLocation();
+			if (location != null) {
+//设置requestURI= path
+				ctx.put(REQUEST_URI_KEY, route.getPath());
+//设置proxy = routeId
+				ctx.put(PROXY_KEY, route.getId());
+//不存在自定义的敏感头信息 设置默认的 ("Cookie", "Set-Cookie", "Authorization")
+				if (!route.isCustomSensitiveHeaders()) {
+					this.proxyRequestHelper.addIgnoredHeaders(
+							this.properties.getSensitiveHeaders().toArray(new String[0]));
+				}
+//存在 就用用户自己定义的
+				else {
+					this.proxyRequestHelper.addIgnoredHeaders(
+							route.getSensitiveHeaders().toArray(new String[0]));
+				}
+//设置重试属性
+				if (route.getRetryable() != null) {
+					ctx.put(RETRYABLE_KEY, route.getRetryable());
+				}
+//如果location以http或https开头，将其添加到RequestContext的routeHost中，在RequestContext的originResponseHeaders中添加X-Zuul-Service与location的键值对；
+				if (location.startsWith(HTTP_SCHEME + ":")
+						|| location.startsWith(HTTPS_SCHEME + ":")) {
+					ctx.setRouteHost(getUrl(location));
+					ctx.addOriginResponseHeader(SERVICE_HEADER, location);
+				}
+//如果location以forward:开头，则将其添加到RequestContext的forward.to中，将RequestContext的routeHost设置为null并返回；
+				else if (location.startsWith(FORWARD_LOCATION_PREFIX)) {
+					ctx.set(FORWARD_TO_KEY,
+							StringUtils.cleanPath(
+									location.substring(FORWARD_LOCATION_PREFIX.length())
+											+ route.getPath()));
+					ctx.setRouteHost(null);
+					return null;
+				}
+//否则将location添加到RequestContext的serviceId中，将RequestContext的routeHost设置为null，在RequestContext的originResponseHeaders中添加X-Zuul-ServiceId与location的键值对。
+				else {
+					// set serviceId for use in filters.route.RibbonRequest
+					ctx.set(SERVICE_ID_KEY, location);
+					ctx.setRouteHost(null);
+					ctx.addOriginResponseHeader(SERVICE_ID_HEADER, location);
+				}
+//如果zuul.addProxyHeaders=true 则在RequestContext的zuulRequestHeaders中添加一系列请求头：X-Forwarded-Host、X-Forwarded-Port、X-Forwarded-Proto、X-Forwarded-Prefix、X-Forwarded-For
+				if (this.properties.isAddProxyHeaders()) {
+					addProxyHeaders(ctx, route);
+					String xforwardedfor = ctx.getRequest()
+							.getHeader(X_FORWARDED_FOR_HEADER);
+					String remoteAddr = ctx.getRequest().getRemoteAddr();
+					if (xforwardedfor == null) {
+						xforwardedfor = remoteAddr;
+					}
+					else if (!xforwardedfor.contains(remoteAddr)) { // Prevent duplicates
+						xforwardedfor += ", " + remoteAddr;
+					}
+					ctx.addZuulRequestHeader(X_FORWARDED_FOR_HEADER, xforwardedfor);
+				}
+//如果zuul.addHostHeader=ture 则在则在RequestContext的zuulRequestHeaders中添加host
+				if (this.properties.isAddHostHeader()) {
+					ctx.addZuulRequestHeader(HttpHeaders.HOST,
+							toHostHeader(ctx.getRequest()));
+				}
+			}
+		}
+//如果 route=null 在RequestContext中将forward.to设置为forwardURI，默认情况下forwardURI为请求路径。              
+		else {
+			log.warn("No route found for uri: " + requestURI);
+			String forwardURI = getForwardUri(requestURI);
+
+			ctx.set(FORWARD_TO_KEY, forwardURI);
+		}
+		return null;
+	}
+}
+```
+
+#### route过滤器
+
+##### RibbonRoutingFilter 使用Ribbon和Hystrix来向服务实例发起请求，并将服务实例的请求结果返回
+
+优先级 10
+RequestContext中的routeHost为null，serviceId不为null。sendZuulResponse=true. 即只对通过serviceId配置路由规则的请求生效
+
+使用Ribbon和Hystrix来向服务实例发起请求，并将服务实例的请求结果返回
+
+##### SimpleHostRoutingFilter
+
+优先级 100
+
+RequestContext中的routeHost不为null。即只对通过url配置路由规则的请求生效
+
+直接向routeHost参数的物理地址发起请求，该请求是直接通过httpclient包实现的，而没有使用Hystrix命令进行包装，所以这类请求并没有线程隔离和熔断器的保护。
+
+##### SendForwardFilter 获取forward.to中保存的跳转地址，跳转过去
+
+优先级 500
+
+RequestContext中的forward.to不为null。即用来处理路由规则中的forward本地跳转配置

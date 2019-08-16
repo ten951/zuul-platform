@@ -127,7 +127,7 @@ FilterLoader.getInstance().getFiltersByType(sType); 是获取sType类型的filte
 	}
 ```
 
-这个filters属性时如何初始化的. 业务自己定义的filter只要交给spring托管, 就可以加载进来. 但是zuul自己提供的10个filter. 就需要FilterFileManager它来负责加载了.
+这个filters属性时如何初始化的. 业务自己定义的filter只要交给spring托管, 就可以加载进来.
 
 #### pre过滤器
 
@@ -296,3 +296,8 @@ public class PreDecorationFilter extends ZuulFilter {
 执行条件：RequestContext中的throwable不为null，且sendErrorFilter.ran属性为false。 
 
 在request中设置javax.servlet.error.status_code、javax.servlet.error.exception、javax.servlet.error.message三个属性。将RequestContext中的sendErrorFilter.ran属性设置为true。然后组织成一个forward到API网关/error错误端点的请求来产生错误响应。
+
+### ZuulProxyAutoConfiguration配置类
+
+是ZuulServerAutoConfiguration的子类, 加入了RestClientRibbonConfiguration OkHttpRibbonConfiguration HttpClientRibbonConfiguration等类. 还将一些filter交给spring托管了.
+集成了 注册发现, Ribbon, 健康检查

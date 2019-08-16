@@ -143,19 +143,19 @@ FilterLoader.getInstance().getFiltersByType(sType); 是获取sType类型的filte
 
 优先级 -1
 
-application/x-www-form-urlencoded 或者 multipart/form-data 时候执行
+执行条件: application/x-www-form-urlencoded 或者 multipart/form-data 时候执行
 
 ##### DebugFilter 将当前RequestContext中的debugRouting和debugRequest参数设置为true
 
 优先级 1
 
-请求中的debug参数（该参数可以通过zuul.debug.parameter来自定义）为true，或者配置参数zuul.debug.request为true时执行
+执行条件: 请求中的debug参数（该参数可以通过zuul.debug.parameter来自定义）为true，或者配置参数zuul.debug.request为true时执行
 
 ##### PreDecorationFilter 
 
 优先级 5
 
-RequestContext不存在forward.to和serviceId两个参数时执行
+执行条件: RequestContext不存在forward.to和serviceId两个参数时执行
 ```java
 public class PreDecorationFilter extends ZuulFilter {
 @Override
@@ -250,7 +250,8 @@ public class PreDecorationFilter extends ZuulFilter {
 ##### RibbonRoutingFilter 使用Ribbon和Hystrix来向服务实例发起请求，并将服务实例的请求结果返回
 
 优先级 10
-RequestContext中的routeHost为null，serviceId不为null。sendZuulResponse=true. 即只对通过serviceId配置路由规则的请求生效
+
+执行条件: RequestContext中的routeHost为null，serviceId不为null。sendZuulResponse=true. 即只对通过serviceId配置路由规则的请求生效
 
 使用Ribbon和Hystrix来向服务实例发起请求，并将服务实例的请求结果返回
 
@@ -258,7 +259,7 @@ RequestContext中的routeHost为null，serviceId不为null。sendZuulResponse=tr
 
 优先级 100
 
-RequestContext中的routeHost不为null。即只对通过url配置路由规则的请求生效
+执行条件: RequestContext中的routeHost不为null。即只对通过url配置路由规则的请求生效
 
 直接向routeHost参数的物理地址发起请求，该请求是直接通过httpclient包实现的，而没有使用Hystrix命令进行包装，所以这类请求并没有线程隔离和熔断器的保护。
 
@@ -266,4 +267,32 @@ RequestContext中的routeHost不为null。即只对通过url配置路由规则�
 
 优先级 500
 
-RequestContext中的forward.to不为null。即用来处理路由规则中的forward本地跳转配置
+执行条件: RequestContext中的forward.to不为null。即用来处理路由规则中的forward本地跳转配置
+
+#### post过滤器
+
+##### SendResponseFilter 在请求响应中增加头信息（根据设置有X-Zuul-Debug-Header、Date、Content-Type、Content-Length等）：addResponseHeaders;发送响应内容：writeResponse。
+
+优先级 1000
+
+执行条件: 没有抛出异常，RequestContext中的throwable属性为null（如果不为null说明已经被error过滤器处理过了，这里的post过滤器就不需要处理了），并且RequestContext中zuulResponseHeaders、responseDataStream、responseBody三者有一样不为null（说明实际请求的响应不为空）。
+
+
+##### LocationRewriteFilter 
+
+优先级 SendResponseFilter - 100
+
+执行条件: HttpStatus.valueOf(statusCode).is3xxRedirection() 响应码是3XX的时候执行
+
+功能: 将Location信息转化为Zuul URL.
+
+
+#### error过滤器
+
+##### SendErrorFilter 
+
+优先级 0
+
+执行条件：RequestContext中的throwable不为null，且sendErrorFilter.ran属性为false。 
+
+在request中设置javax.servlet.error.status_code、javax.servlet.error.exception、javax.servlet.error.message三个属性。将RequestContext中的sendErrorFilter.ran属性设置为true。然后组织成一个forward到API网关/error错误端点的请求来产生错误响应。

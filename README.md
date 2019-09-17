@@ -1,5 +1,8 @@
 # zuul-platform
 
+
+[zuul使用Ribbon和Hystrix](#Ribbon和Hystrix)
+
 ## 启动zuul网关模块  
 这里涉及了spring的注解驱动. 自动配置等相关知识
 @EnableZuulProxy-> @import(ZuulProxyMarkerConfiguration.class)-> @Bean就是初始化了Marker类. 相当于打标记
@@ -297,7 +300,290 @@ public class PreDecorationFilter extends ZuulFilter {
 
 在request中设置javax.servlet.error.status_code、javax.servlet.error.exception、javax.servlet.error.message三个属性。将RequestContext中的sendErrorFilter.ran属性设置为true。然后组织成一个forward到API网关/error错误端点的请求来产生错误响应。
 
-### ZuulProxyAutoConfiguration配置类
+## Ribbon和Hystrix
+
+### ZuulProxyAutoConfiguration配置类 
+
+```java
+@Configuration
+//加载这个4个类
+@Import({ RibbonCommandFactoryConfiguration.RestClientRibbonConfiguration.class,
+		RibbonCommandFactoryConfiguration.OkHttpRibbonConfiguration.class,
+		RibbonCommandFactoryConfiguration.HttpClientRibbonConfiguration.class,
+		HttpClientConfiguration.class })
+@ConditionalOnBean(ZuulProxyMarkerConfiguration.Marker.class)
+public class ZuulProxyAutoConfiguration extends ZuulServerAutoConfiguration {
+    @Bean
+	@ConditionalOnMissingBean(RibbonRoutingFilter.class)
+	public RibbonRoutingFilter ribbonRoutingFilter(ProxyRequestHelper helper,
+			RibbonCommandFactory<?> ribbonCommandFactory) {
+        //ribbonCommandFactory这个具体是什么类型 取决import导入的类
+		RibbonRoutingFilter filter = new RibbonRoutingFilter(helper, ribbonCommandFactory,
+				this.requestCustomizers);
+		return filter;
+	}
+
+	@Bean
+	@ConditionalOnMissingBean({ SimpleHostRoutingFilter.class,
+			CloseableHttpClient.class })
+	public SimpleHostRoutingFilter simpleHostRoutingFilter(ProxyRequestHelper helper,
+			ZuulProperties zuulProperties,
+			ApacheHttpClientConnectionManagerFactory connectionManagerFactory,
+			ApacheHttpClientFactory httpClientFactory) {
+		return new SimpleHostRoutingFilter(helper, zuulProperties,
+				connectionManagerFactory, httpClientFactory);
+	}
+}
+```
+
+ZuulProxyAutoConfiguration自动配置类. 
 
 是ZuulServerAutoConfiguration的子类, 加入了RestClientRibbonConfiguration OkHttpRibbonConfiguration HttpClientRibbonConfiguration等类. 还将一些filter交给spring托管了.
 集成了 注册发现, Ribbon, 健康检查
+
+在RibbonRoutingFilter看到了zuul在什么时候启动ribbon的. 同时出现了RibbonCommand类. 这是实现了HystrixExecutable. 这个类是可以理解为Hystrix的执行器.
+RibbonCommand有四个子类. 一个抽象类AbstractRibbonCommand和三个实现类 分别是依据httpClient实现的和OkHttp实现的以及RestClient实现的.
+
+
+#### RibbonCommand创建
+
+这里使用了设计模式抽象工厂方法模式. RibbonCommandFactory工厂类接口 AbstractRibbonCommandFactory抽象类. 功能是记录FallbackProvider. 相当于注册表.用map记录.
+三种RibbonCommand创建都有各自工厂去构建. 
+
+#### 三种工厂类的构建
+
+##### RibbonCommandFactoryConfiguration 工厂类自动配置
+```java
+// 以okHttp为例子
+public class RibbonCommandFactoryConfiguration {
+
+            @Target({ ElementType.TYPE, ElementType.METHOD })
+        	@Retention(RetentionPolicy.RUNTIME)
+        	@Documented
+        	@Conditional(OnRibbonOkHttpClientCondition.class)
+        	@interface ConditionalOnRibbonOkHttpClient {
+        
+        	}
+
+
+
+        @Configuration
+        // ribbon.okhttp.enabled yml文件中存在这个属性
+    	@ConditionalOnRibbonOkHttpClient
+        // 环境中存在这个类okhttp3.OkHttpClient
+    	@ConditionalOnClass(name = "okhttp3.OkHttpClient")
+    	protected static class OkHttpRibbonConfiguration {
+    
+    		@Autowired(required = false)
+            //FallbackProvider的所有实现类 必须添加注解@Component. 在这里可以组装完成.
+    		private Set<FallbackProvider> zuulFallbackProviders = Collections.emptySet();
+            // @Bean 注册到Spring IOC容器中.
+    		@Bean
+    		@ConditionalOnMissingBean
+    		public RibbonCommandFactory<?> ribbonCommandFactory(
+    				SpringClientFactory clientFactory, ZuulProperties zuulProperties) {
+    			return new OkHttpRibbonCommandFactory(clientFactory, zuulProperties,
+    					zuulFallbackProviders);
+    		}
+    
+    	}
+
+	private static class OnRibbonOkHttpClientCondition extends AnyNestedCondition {
+
+		OnRibbonOkHttpClientCondition() {
+			super(ConfigurationPhase.PARSE_CONFIGURATION);
+		}
+
+		@ConditionalOnProperty("ribbon.okhttp.enabled")
+		static class RibbonProperty {
+
+		}
+
+	}
+}
+```
+其他的实现也是相同的套路.  
+> ribbon.restclient.enabled 使用RestClientRibbonCommandFactory
+> ribbon.okhttp.enabled  使用OkHttpRibbonCommandFactory
+> ribbon.httpclient.enabled matchIfMissing=true 意思是当不设置任何值的时候,默认初始HttpClientRibbonCommandFactory
+
+在结合ZuulProxyAutoConfiguration类中@Bean RibbonRoutingFilter的构建. 在项目启动完成后, 
+RibbonRoutingFilter通过RibbonCommandFactory.create()方法. 是可以构建出RibbonCommand类的. 
+
+##### RibbonRoutingFilter 过滤器
+
+```text
+	protected ClientHttpResponse forward(RibbonCommandContext context) throws Exception {
+		Map<String, Object> info = this.helper.debug(context.getMethod(),
+				context.getUri(), context.getHeaders(), context.getParams(),
+				context.getRequestEntity());
+        // 这里的逻辑就清楚了.
+		RibbonCommand command = this.ribbonCommandFactory.create(context);
+		try {
+			ClientHttpResponse response = command.execute();
+			this.helper.appendDebug(info, response.getRawStatusCode(),
+					response.getHeaders());
+			return response;
+		}
+		catch (HystrixRuntimeException ex) {
+			return handleException(info, ex);
+		}
+
+	}
+```
+
+##### AbstractRibbonCommand类
+
+* OkHttpRibbonCommandFactory#create()方法  杂糅了很多类的关键方法.
+```text
+@Override
+	public OkHttpRibbonCommand create(final RibbonCommandContext context) {
+//这个不解释
+		final String serviceId = context.getServiceId();
+//依据服务ID获得FallbackProvider
+		FallbackProvider fallbackProvider = getFallbackProvider(serviceId);
+//创建负载均衡客户端
+		final OkHttpLoadBalancingClient client = this.clientFactory.getClient(serviceId,
+				OkHttpLoadBalancingClient.class);
+// 设置负载均衡
+		client.setLoadBalancer(this.clientFactory.getLoadBalancer(serviceId));
+//创建OkHttpRibbonCommand实例,
+		return new OkHttpRibbonCommand(serviceId, client, context, zuulProperties,
+				fallbackProvider, clientFactory.getClientConfig(serviceId));
+	}
+    
+	public OkHttpRibbonCommand(final String commandKey,
+			final OkHttpLoadBalancingClient client, final RibbonCommandContext context,
+			final ZuulProperties zuulProperties,
+			final FallbackProvider zuulFallbackProvider, final IClientConfig config) {
+        //调用父类的构造方法
+		super(commandKey, client, context, zuulProperties, zuulFallbackProvider, config);
+	}
+
+	public AbstractRibbonCommand(String commandKey, LBC client,
+			RibbonCommandContext context, ZuulProperties zuulProperties,
+			FallbackProvider fallbackProvider, IClientConfig config) {
+        //getSetter 设置Hystrix的属性值
+		this(getSetter(commandKey, zuulProperties, config), client, context,
+				fallbackProvider, config);
+	}
+
+    protected static Setter getSetter(final String commandKey,
+			ZuulProperties zuulProperties, IClientConfig config) {
+
+		// @formatter:off commandKey= serviceId 每个CommandKey代表一个依赖抽象,相同的依赖要使用相同的CommandKey名称。依赖隔离的根本就是对相同CommandKey的依赖做隔离.
+        //CommandGroup 命令分组用于对依赖操作分组,便于统计,汇总等.
+		Setter commandSetter = Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("RibbonCommand"))
+								.andCommandKey(HystrixCommandKey.Factory.asKey(commandKey));
+        // 构建了策略和超时时间
+		final HystrixCommandProperties.Setter setter = createSetter(config, commandKey, zuulProperties);
+        //信号量方式
+		if (zuulProperties.getRibbonIsolationStrategy() == ExecutionIsolationStrategy.SEMAPHORE) {
+			final String name = ZuulConstants.ZUUL_EUREKA + commandKey + ".semaphore.maxSemaphores";
+			// we want to default to semaphore-isolation since this wraps
+			// 2 others commands that are already thread isolated
+            // 获取信号量大小 默认值100
+			final DynamicIntProperty value = DynamicPropertyFactory.getInstance()
+					.getIntProperty(name, zuulProperties.getSemaphore().getMaxSemaphores());
+			setter.withExecutionIsolationSemaphoreMaxConcurrentRequests(value.get());
+		}
+        //线程池方式
+		else if (zuulProperties.getThreadPool().isUseSeparateThreadPools()) {
+            //每个serviceId一个线程池
+			final String threadPoolKey = zuulProperties.getThreadPool().getThreadPoolKeyPrefix() + commandKey;
+			commandSetter.andThreadPoolKey(HystrixThreadPoolKey.Factory.asKey(threadPoolKey));
+		}
+		return commandSetter.andCommandPropertiesDefaults(setter);
+		// @formatter:on
+	}
+
+    protected static HystrixCommandProperties.Setter createSetter(IClientConfig config,
+			String commandKey, ZuulProperties zuulProperties) {
+    //设置Hystrix超时时间
+		int hystrixTimeout = getHystrixTimeout(config, commandKey);
+    //设置策略 ribbon的默认策略是信息量
+		return HystrixCommandProperties.Setter()
+				.withExecutionIsolationStrategy(
+						zuulProperties.getRibbonIsolationStrategy())
+				.withExecutionTimeoutInMilliseconds(hystrixTimeout);
+	}
+
+protected static int getHystrixTimeout(IClientConfig config, String commandKey) {
+//获取Ribbon的超时时间
+		int ribbonTimeout = getRibbonTimeout(config, commandKey);
+		DynamicPropertyFactory dynamicPropertyFactory = DynamicPropertyFactory
+				.getInstance();
+// 默认的超时时间
+		int defaultHystrixTimeout = dynamicPropertyFactory.getIntProperty(
+				"hystrix.command.default.execution.isolation.thread.timeoutInMilliseconds",
+				0).get();
+// 获取针对serviceId设置的超时时间
+		int commandHystrixTimeout = dynamicPropertyFactory
+				.getIntProperty("hystrix.command." + commandKey
+						+ ".execution.isolation.thread.timeoutInMilliseconds", 0)
+				.get();
+		int hystrixTimeout;
+// 
+		if (commandHystrixTimeout > 0) {
+			hystrixTimeout = commandHystrixTimeout;
+		}
+		else if (defaultHystrixTimeout > 0) {
+			hystrixTimeout = defaultHystrixTimeout;
+		}
+		else {
+			hystrixTimeout = ribbonTimeout;
+		}
+// 可以理解为 设置了默认的就用默认的. 否则用serviceId的.如果都没设置用ribbon设置的
+		if (hystrixTimeout < ribbonTimeout) {
+			LOGGER.warn("The Hystrix timeout of " + hystrixTimeout + "ms for the command "
+					+ commandKey
+					+ " is set lower than the combination of the Ribbon read and connect timeout, "
+					+ ribbonTimeout + "ms.");
+		}
+		return hystrixTimeout;
+	}
+
+	protected static int getRibbonTimeout(IClientConfig config, String commandKey) {
+		int ribbonTimeout;
+        //如何用户没有自定义使用系统默认的 2000ms
+		if (config == null) {
+			ribbonTimeout = RibbonClientConfiguration.DEFAULT_READ_TIMEOUT
+					+ RibbonClientConfiguration.DEFAULT_CONNECT_TIMEOUT;
+		}
+        //读取用户设置的
+		else {
+			int ribbonReadTimeout = getTimeout(config, commandKey, "ReadTimeout",
+					IClientConfigKey.Keys.ReadTimeout,
+					RibbonClientConfiguration.DEFAULT_READ_TIMEOUT);
+			int ribbonConnectTimeout = getTimeout(config, commandKey, "ConnectTimeout",
+					IClientConfigKey.Keys.ConnectTimeout,
+					RibbonClientConfiguration.DEFAULT_CONNECT_TIMEOUT);
+			int maxAutoRetries = getTimeout(config, commandKey, "MaxAutoRetries",
+					IClientConfigKey.Keys.MaxAutoRetries,
+					DefaultClientConfigImpl.DEFAULT_MAX_AUTO_RETRIES);
+			int maxAutoRetriesNextServer = getTimeout(config, commandKey,
+					"MaxAutoRetriesNextServer",
+					IClientConfigKey.Keys.MaxAutoRetriesNextServer,
+					DefaultClientConfigImpl.DEFAULT_MAX_AUTO_RETRIES_NEXT_SERVER);
+
+			ribbonTimeout = (ribbonReadTimeout + ribbonConnectTimeout)
+					* (maxAutoRetries + 1) * (maxAutoRetriesNextServer + 1);
+		}
+		return ribbonTimeout;
+	}
+
+	private static int getTimeout(IClientConfig config, String commandKey,
+			String property, IClientConfigKey<Integer> configKey, int defaultValue) {
+		DynamicPropertyFactory dynamicPropertyFactory = DynamicPropertyFactory
+				.getInstance();
+		return dynamicPropertyFactory
+				.getIntProperty(commandKey + "." + config.getNameSpace() + "." + property,
+						config.get(configKey, defaultValue))
+				.get();
+	}
+```
+当OkHttpRibbonCommand创建完成后, 这些数据就都设置完成了, 
+
+
+
+

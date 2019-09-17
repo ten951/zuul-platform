@@ -3,3 +3,4 @@ spring:
     name: zuul
 server:
   port: 8080
+
